@@ -1,0 +1,15 @@
+[package]
+name = "lunic"
+version = "0.1.0"
+authors = ["karitra <karev.alexandre@gmail.com>"]
+
+[dependencies]
+cocaine = {path="/home/karapuz/prj/ya/cocaine/cocaine-framework-rust"}
+tokio-core = "0.1"
+futures = "0.1.14"
+serde = "1"
+serde_derive = "1"
+serde_json = "1"
+clap = "~2.26.2"
+yaml-rust = "0"
+time = "0"
