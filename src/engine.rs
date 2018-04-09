@@ -18,10 +18,14 @@ use futures::{
 use futures::future::join_all;
 
 use std::convert::AsRef;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time;
 use std::io;
+use std::fmt;
+use std::time::Duration;
+
+use time;
 
 use cocaine::Service;
 use cocaine::service::Unicorn;
@@ -34,8 +38,8 @@ use dummy;
 
 const ZVM: &str = "tvm";
 
+type DummyTable = HashMap<String, dummy::DummyRecord>;
 type AuthHeaders = Vec<RawHeader>;
-
 
 #[derive(Debug)]
 pub enum CombinedError {
@@ -44,7 +48,7 @@ pub enum CombinedError {
 }
 
 
-fn make_dummy_table(size: u32) -> HashMap<String, dummy::DummyRecord> {
+fn make_dummy_table(size: u32) -> DummyTable {
     let mut init_data = HashMap::new();
 
     for i in 0..size {
@@ -55,42 +59,49 @@ fn make_dummy_table(size: u32) -> HashMap<String, dummy::DummyRecord> {
     init_data
 }
 
-
-fn make_auth_headers(header: Option<String>) -> Option<AuthHeaders>  {
-    header.and_then(|hdr|
-        Some(vec![ RawHeader::new("authorization".as_bytes(), hdr.into_bytes()) ])
-    )
+fn make_auth_headers(header: Option<String>) -> AuthHeaders  {
+    match header {
+        Some(header) => vec![ RawHeader::new("authorization".as_bytes(), header.into_bytes()) ],
+        None => vec![]
+    }
 }
 
 // TODO: make use of AsRef<str>
 pub fn create_nodes<'a, S, T>(unicorn: &'a Unicorn, config: &Config, prefixes: &'a [S], init_data: &'a T, handle: Handle)
     -> Box<Future<Item=bool, Error=CombinedError> + 'a>
 where
-    S: AsRef<str> + 'a,
+    S: AsRef<str> + fmt::Display + 'a,
     for<'de> T: Deserialize<'de> + Serialize + 'a
  {
-
-    let mut completions = Vec::with_capacity(prefixes.len());
     let mut proxy = secure::make_ticket_service(Service::new(ZVM, &handle), &config);
 
-    let completions = proxy.ticket_as_header()
+    let result = proxy.ticket_as_header()
         .and_then(move |header| {
+            let mut completions = Vec::with_capacity(prefixes.len());
             let headers = make_auth_headers(header);
+
+            // println!("got headers {:?}", headers);
+
             for prefix in prefixes.clone() {
+                // println!("\tcreating for prefix {}", prefix);
                 let created = unicorn.create(prefix.as_ref(), init_data, headers.clone());
                 completions.push(created);
             }
 
-            // Ok(completions)
+            // println!("join on completion complete");
             join_all(completions)
-        });
-
-    let result = completions
-        .map_err(CombinedError::CocaineError)
+        })
         .and_then(|is_created| {
+            println!("create applied {} times", is_created.len());
             let is_all_done = is_created.into_iter().all(|x| x.unwrap_or(false));
             Ok(is_all_done)
-        });
+        })
+        .or_else(|e| {
+            println!("error while creating nodes {:?}", e);
+            println!("skipping to next operation");
+            Ok(false)
+        })
+        .map_err(CombinedError::CocaineError);
 
     Box::new(result)
 }
@@ -103,6 +114,7 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
     let result = proxy.ticket_as_header()
         .and_then(move |header| {
             let headers = make_auth_headers(header);
+
             let hdr_to_move1 = headers.clone();
             let hdr_to_move2 = headers.clone();
             let hdr_to_move3 = headers.clone();
@@ -111,21 +123,21 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
             unicorn.children_subscribe(path, headers.clone())
                 .and_then(move |(tx, stream)| {
 
-                    println!("got stream");
+                    // println!("got stream");
 
                     let to_delete = Vec::new();
-                    let to_delete_rc = Rc::new(to_delete);
+                    let to_delete_rc = Rc::new(RefCell::new(to_delete));
                     let to_delete_rc_stream = Rc::clone(&to_delete_rc);
 
-                    stream.for_each(move |(version, nodes)| {
-                        println!("version {}", version);
+                    stream.take(1).for_each(move |(_version, nodes)| {
+                        // println!("version {}", version);
 
-                        let mut to_delete_rc = Rc::clone(&to_delete_rc_stream);
+                        let to_delete_rc = Rc::clone(&to_delete_rc_stream);
 
                         for node in &nodes {
-                            println!("{:?}", node);
                             let path = format!("{}/{}", path, node);
-                            Rc::get_mut(&mut to_delete_rc).unwrap().push(path);
+                            // println!("\tpath {:?}", node);
+                            to_delete_rc.borrow_mut().push(path);
                         }
 
                         Ok(())
@@ -136,21 +148,29 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
                     })
                 })
                 .and_then(move |to_delete_rc| {
-
                     let mut get = Vec::new();
-                    for node in to_delete_rc.iter() {
+                    let now = time::now();
+                    for node in to_delete_rc.borrow().iter() {
+                        // println!("\tgetting data for node {}", node);
                         let node_path_copy = node.clone();
-                        let f = unicorn.get::<dummy::DummyRecord,_>(node, hdr_to_move1.clone())
+                        let f = unicorn.get::<DummyTable,_>(node, hdr_to_move1.clone())
                             .and_then(|(_, version)| {
                                 Ok((node_path_copy, version))
                             });
                         get.push(f);
                     }
-                    join_all(get)
+                    join_all(get).and_then(move |vec| Ok((now, vec)))
                 })
-                .and_then(move |delete_task| {
+                .and_then(move |(start, delete_task)| {
+
+                    let diff = time::now() - start;
+                    println!("get of {} items took {}ms", delete_task.len(), diff.num_milliseconds());
+
+                    // println!("delete_task task size {}", delete_task.len());
                     let mut del = Vec::new();
                     for (node, version) in delete_task {
+                        // println!("posting delete for subnode {1} {0}", node, version);
+                        // let f = unicorn.del(&node, &version, hdr_to_move2.clone());
                         let f = unicorn.del(&node, &version, hdr_to_move2.clone());
                         del.push(f);
                     }
@@ -158,17 +178,21 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
                     join_all(del)
                 })
                 .and_then(move |flags| {
+                    println!("{} subnodes deleted", flags.len());
                     let v = flags.iter().all(|x| x.unwrap_or(false));
                     Ok(v)
                 })
                 .and_then(move |is_subs_removed| {
-                    unicorn.get::<Vec<String>,_>(path, hdr_to_move3)
+                    println!("deleting main node {}", path);
+                    unicorn.get::<DummyTable,_>(path, hdr_to_move3)
                         .and_then(move |(_,version)| {
                             Ok((version, is_subs_removed))
                         })
                 })
                 .and_then(move |(version, is_subs_removed)| {
-                    unicorn.del(path, &version, hdr_to_move4)
+                    println!("ready to delete parent node {}", path);
+                    unicorn.del(path, &version, hdr_to_move4.clone())
+                    // unicorn.del(path, &version, Vec::new())
                         .and_then(move |is_removed| match is_removed {
                             Some(is_removed) => Ok(is_removed && is_subs_removed),
                             None => Ok(false)
@@ -197,6 +221,8 @@ pub fn create_sleep_remove(config: &Config, path: &str, to_sleep: u64, count: u3
     let unicorn = Unicorn::new(Service::new("unicorn", &handle));
 
     let handle = core.handle();
+
+    println!("creating parent node: {}", path);
     let create = create_nodes(&unicorn, &config, parent, &init_data, handle.clone())
         .and_then(|_| {
             println!("creating subnodes in the {}", path);
@@ -206,7 +232,7 @@ pub fn create_sleep_remove(config: &Config, path: &str, to_sleep: u64, count: u3
     let sleep = create
         .and_then(|ok| {
             println!("sleeping for {} seconds, create result is {:?}", to_sleep, ok);
-            Timeout::new(time::Duration::from_secs(to_sleep), &handle).unwrap()
+            Timeout::new(Duration::from_secs(to_sleep), &handle).unwrap()
                 .map_err(CombinedError::IOError)
         });
 
@@ -218,6 +244,6 @@ pub fn create_sleep_remove(config: &Config, path: &str, to_sleep: u64, count: u3
 
     match core.run(complete) {
         Ok(result) => println!("result of complete operation: {:?}", result),
-        Err(e) => println!("error while removing nodes {:?}", e)
+        Err(e) => println!("error while complete operation {:?}", e)
     }
 }
