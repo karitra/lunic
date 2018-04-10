@@ -19,7 +19,6 @@ use futures::future::join_all;
 
 use std::convert::AsRef;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::io;
 use std::fmt;
@@ -30,33 +29,18 @@ use time;
 use cocaine::Service;
 use cocaine::service::Unicorn;
 use cocaine::hpack::RawHeader;
-use cocaine::{
-    Error,
-};
+use cocaine::Error;
 
 use dummy;
 
 const ZVM: &str = "tvm";
 
-type DummyTable = HashMap<String, dummy::DummyRecord>;
 type AuthHeaders = Vec<RawHeader>;
 
 #[derive(Debug)]
 pub enum CombinedError {
     IOError(io::Error),
     CocaineError(Error),
-}
-
-
-fn make_dummy_table(size: u32) -> DummyTable {
-    let mut init_data = HashMap::new();
-
-    for i in 0..size {
-        let key = format!("some_{}", i);
-        init_data.insert(key, dummy::DummyRecord::new(i as i32));
-    }
-
-    init_data
 }
 
 fn make_auth_headers(header: Option<String>) -> AuthHeaders  {
@@ -93,7 +77,7 @@ where
         })
         .and_then(|is_created| {
             println!("create applied {} times", is_created.len());
-            let is_all_done = is_created.into_iter().all(|x| x.unwrap_or(false));
+            let is_all_done = is_created.into_iter().all(|x| x);
             Ok(is_all_done)
         })
         .or_else(|e| {
@@ -153,7 +137,7 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
                     for node in to_delete_rc.borrow().iter() {
                         // println!("\tgetting data for node {}", node);
                         let node_path_copy = node.clone();
-                        let f = unicorn.get::<DummyTable,_>(node, hdr_to_move1.clone())
+                        let f = unicorn.get::<dummy::DummyTable,_>(node, hdr_to_move1.clone())
                             .and_then(|(_, version)| {
                                 Ok((node_path_copy, version))
                             });
@@ -179,12 +163,12 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
                 })
                 .and_then(move |flags| {
                     println!("{} subnodes deleted", flags.len());
-                    let v = flags.iter().all(|x| x.unwrap_or(false));
+                    let v = flags.iter().all(|x| *x);
                     Ok(v)
                 })
                 .and_then(move |is_subs_removed| {
                     println!("deleting main node {}", path);
-                    unicorn.get::<DummyTable,_>(path, hdr_to_move3)
+                    unicorn.get::<dummy::DummyTable,_>(path, hdr_to_move3)
                         .and_then(move |(_,version)| {
                             Ok((version, is_subs_removed))
                         })
@@ -192,11 +176,7 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
                 .and_then(move |(version, is_subs_removed)| {
                     println!("ready to delete parent node {}", path);
                     unicorn.del(path, &version, hdr_to_move4.clone())
-                    // unicorn.del(path, &version, Vec::new())
-                        .and_then(move |is_removed| match is_removed {
-                            Some(is_removed) => Ok(is_removed && is_subs_removed),
-                            None => Ok(false)
-                        })
+                        .and_then(move |is_removed| Ok(is_removed && is_subs_removed))
                 })
         })
         .map_err(CombinedError::CocaineError);
@@ -207,7 +187,7 @@ fn remove_with_subnodes<'a>(unicorn: &'a Unicorn, config: &Config, path: &'a str
 
 pub fn create_sleep_remove(config: &Config, path: &str, to_sleep: u64, count: u32, size: u32) {
     let parent = &[path];
-    let init_data = make_dummy_table(size);
+    let init_data = dummy::make_table(size);
 
     let subnodes = (0..count)
         .map(|i| {
